@@ -1,0 +1,8 @@
+[package]
+name = "usb-hub-control"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nusb = { git = "https://github.com/kevinmehall/nusb.git", rev = "a243514f583495e774aeb1d936d083487b36f211" }
+env_logger = "0.11"
