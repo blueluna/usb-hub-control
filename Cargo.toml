@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 nusb = { git = "https://github.com/kevinmehall/nusb.git", rev = "a243514f583495e774aeb1d936d083487b36f211" }
 env_logger = "0.11"
+clap = { version = "4.5", features = ["derive"] }
+bitflags = "2.9"
+regex = "1.11"
