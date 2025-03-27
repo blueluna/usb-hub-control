@@ -530,6 +530,7 @@ dependencies = [
  "bitflags",
  "clap",
  "env_logger",
+ "log",
  "nusb",
  "regex",
 ]

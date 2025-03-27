@@ -1,10 +1,17 @@
+/// USB hub control error
 #[derive(Debug)]
 pub enum Error {
+    /// USB error reported by `nusb`
     UsbError(nusb::Error),
+    /// USB transfer error reported by `nusb`
     UsbTransferError(nusb::transfer::TransferError),
+    /// I/O error reported by `std::io`
     IoError(std::io::Error),
+    /// Device with invalid device class was provided
     InvalidDeviceClass,
+    /// Transfer responded with invalid data
     InvalidRespone,
+    /// Invalid port provided
     InvalidPort,
 }
 

@@ -55,13 +55,43 @@ fn describe_hub<W: Write>(
             .join("-")
     );
 
+    let container_id_str = if let Some(c) = hub.container_id() {
+        let c = c.0;
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            c[5],
+            c[6],
+            c[7],
+            c[8],
+            c[9],
+            c[10],
+            c[11],
+            c[12],
+            c[13],
+            c[14],
+            c[15]
+        )
+    } else {
+        String::new()
+    };
+
     let _ = writeln!(
         output,
-        "{} {:04x}:{:04x} {}",
+        "{} {:04x}:{:04x} {:02x} {:02x} {:02x} {:04x} {} {}",
         key_string,
         info.vendor_id(),
         info.product_id(),
+        info.class(),
+        info.subclass(),
+        info.protocol(),
+        info.device_version(),
         hub.port_count(),
+        container_id_str,
     );
 
     for port in 1..=hub.port_count() {
@@ -70,20 +100,21 @@ fn describe_hub<W: Write>(
         let connection = match hub.port_status(port) {
             Ok(status) => {
                 let connection = if status.connection() {
-                    "connection"
+                    " connection"
                 } else {
                     ""
                 };
-                let enabled = if status.enabled() { "enabled" } else { "" };
+                let enabled = if status.enabled() { " enabled" } else { "" };
                 let overcurrent = if status.overcurrent() {
-                    "overcurrent"
+                    " overcurrent"
                 } else {
                     ""
                 };
+                let powered = if status.powered() { " powered" } else { "" };
                 let _ = write!(
                     output,
-                    "{:align$} {} {:04x} {} {} {}",
-                    "", port, status.0, connection, enabled, overcurrent
+                    "{:align$} {} {:04x}{}{}{}{} ",
+                    "", port, status.0, connection, enabled, overcurrent, powered
                 );
                 status.connection()
             }
@@ -117,7 +148,7 @@ fn list(info_map: &BTreeMap<Vec<u8>, nusb::DeviceInfo>) -> Result<(), Error> {
     let mut buffer = Vec::new();
     for (key, info) in info_map.iter() {
         if key.len() == 2 && info.class() == DEVICE_CLASS_HUB {
-            describe_hub(&mut buffer, key, &info_map)?;
+            describe_hub(&mut buffer, key, info_map)?;
         }
     }
     let output = std::str::from_utf8(buffer.as_slice()).unwrap().to_string();
@@ -164,7 +195,7 @@ fn main() {
     match args.command {
         Some(Commands::Power { port, on, location }) => {
             let location_regex = Regex::new(
-                r"^(?<busnum>[[:digit:]]+)[.](?<chain>(?:(?:[[:digit:]]+)-)*(?:[[:digit:]]+))$",
+                r"^(?<busnum>[[:digit:]]+)-(?<chain>(?:(?:[[:digit:]]+)[.])*(?:[[:digit:]]+))$",
             )
             .unwrap();
             let key = if let Some(location) = location {
@@ -173,7 +204,7 @@ fn main() {
                         let busnum = b.as_str().parse::<u8>().unwrap();
                         let chain = c
                             .as_str()
-                            .split('-')
+                            .split('.')
                             .filter_map(|v| v.parse::<u8>().ok())
                             .collect::<Vec<u8>>();
                         let mut key = vec![busnum];
@@ -189,19 +220,15 @@ fn main() {
                 None
             };
             if let Some(k) = key {
-                println!(
-                    "PORT {} ON {} KEY {:?}",
-                    port,
-                    if on { "on" } else { "off" },
-                    k
-                );
                 if let Some(info) = info_map.get(&k) {
                     let hub = Hub::from_device_info(info).unwrap();
                     println!(
-                        "PORT {} ON {} KEY {:?}",
+                        "PORT {} {} KEY {:?} {:02x} {:02x}",
                         port,
                         if on { "on" } else { "off" },
-                        k
+                        k,
+                        info.busnum(),
+                        info.device_address()
                     );
                     if let Err(e) = hub.set_port_power(port, on) {
                         eprint!("Failed to switch port, {}", e);
