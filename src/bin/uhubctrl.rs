@@ -46,13 +46,13 @@ fn describe_hub<W: Write>(
     let hub = Hub::from_device_info(info)?;
 
     let key_string = format!(
-        "{}.{}",
+        "{}-{}",
         info.busnum(),
         info.port_chain()
             .iter()
             .map(|v| v.to_string())
             .collect::<Vec<String>>()
-            .join("-")
+            .join(".")
     );
 
     let container_id_str = if let Some(c) = hub.container_id() {
@@ -234,6 +234,12 @@ fn main() {
                         eprint!("Failed to switch port, {}", e);
                     }
                 }
+                else {
+                    eprintln!("Hub not found");
+                }
+            }
+            else {
+                eprintln!("Invalid location");
             }
         }
         _ => match list(&info_map) {
