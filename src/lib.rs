@@ -17,6 +17,9 @@ pub use error::Error;
 /// USB version 3.0 code
 pub const USB_VERSION_3_0: u16 = 0x0300;
 
+/// USB hub device class
+pub const DEVICE_CLASS_HUB: u8 = 0x09;
+
 /// USB hub
 pub struct Hub {
     info: DeviceInfo,
@@ -29,13 +32,12 @@ pub struct Hub {
 impl Hub {
     /// Create a Hub from DeviceInfo
     pub fn from_device_info(info: &DeviceInfo) -> Result<Self, Error> {
-        const DEVICE_CLASS_HUB: u8 = 0x09;
         if info.class() != DEVICE_CLASS_HUB {
             Err(Error::InvalidDeviceClass)
         } else {
             let device = info.open().wait()?;
             let descriptor = device.device_descriptor();
-            let super_speed = descriptor.usb_version() > USB_VERSION_3_0;
+            let super_speed = descriptor.usb_version() >= USB_VERSION_3_0;
             let hub_descriptor = Self::get_hub_description(&device, super_speed)?;
 
             let lpsm = hub_descriptor.logical_power_switching_mode();
@@ -147,6 +149,101 @@ impl Hub {
     /// Get Hub container id
     pub fn container_id(&self) -> Option<ContainerId> {
         self.container_id.clone()
+    }
+
+    /// Hub is the SuperSpeed (USB 3) half of a hub
+    pub fn is_super_speed(&self) -> bool {
+        self.super_speed
+    }
+
+    /// Find the port on the other half of the physical hub that shares a connector with `port`.
+    ///
+    /// A USB 3 hub shows up as two hubs, one USB 2 and one SuperSpeed, and each physical
+    /// connector has a port on both. On Linux the kernel's port peer links in sysfs are used.
+    /// Otherwise, or if they are missing, the hub with the same container id and the other
+    /// speed is used, assuming the same port number.
+    pub fn peer_port<'a>(
+        &self,
+        port: u8,
+        devices: impl IntoIterator<Item = &'a DeviceInfo> + Clone,
+    ) -> Option<(DeviceInfo, u8)> {
+        #[cfg(target_os = "linux")]
+        if let Some(peer) = self.sysfs_peer_port(port, devices.clone()) {
+            return Some(peer);
+        }
+        self.container_id_peer_port(port, devices)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sysfs_peer_port<'a>(
+        &self,
+        port: u8,
+        devices: impl IntoIterator<Item = &'a DeviceInfo>,
+    ) -> Option<(DeviceInfo, u8)> {
+        let path = self.info.sysfs_path();
+        let name = path.file_name()?.to_str()?;
+        let port_dir = format!("{}-port{}", name, port);
+
+        // The port directories live in the hub interface directory, e.g. 5-1.3:1.0/5-1.3-port4
+        let peer = std::fs::read_dir(path)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(':'))
+            .find_map(|entry| std::fs::read_link(entry.path().join(&port_dir).join("peer")).ok())?;
+        let peer = peer.file_name()?.to_str()?;
+        trace!("Port {} peer {}", port_dir, peer);
+
+        let (hub_name, peer_port) = peer.rsplit_once("-port")?;
+        let peer_port = peer_port.parse::<u8>().ok()?;
+        let (busnum, chain) = if let Some(bus) = hub_name.strip_prefix("usb") {
+            (bus.parse::<u8>().ok()?, vec![])
+        } else {
+            let (bus, chain) = hub_name.split_once('-')?;
+            let chain = chain
+                .split('.')
+                .map(|v| v.parse::<u8>().ok())
+                .collect::<Option<Vec<u8>>>()?;
+            (bus.parse::<u8>().ok()?, chain)
+        };
+
+        devices
+            .into_iter()
+            .find(|info| info.busnum() == busnum && info.port_chain() == chain.as_slice())
+            .map(|info| (info.clone(), peer_port))
+    }
+
+    fn container_id_peer_port<'a>(
+        &self,
+        port: u8,
+        devices: impl IntoIterator<Item = &'a DeviceInfo>,
+    ) -> Option<(DeviceInfo, u8)> {
+        let container_id = self.container_id.as_ref()?;
+        let candidates = devices
+            .into_iter()
+            .filter(|info| {
+                info.class() == DEVICE_CLASS_HUB
+                    && info.port_chain().len() == self.info.port_chain().len()
+                    && !(info.busnum() == self.info.busnum()
+                        && info.port_chain() == self.info.port_chain())
+            })
+            .filter_map(|info| Hub::from_device_info(info).ok())
+            .filter(|hub| {
+                hub.super_speed != self.super_speed
+                    && hub.container_id.as_ref() == Some(container_id)
+            })
+            .map(|hub| hub.info)
+            .collect::<Vec<_>>();
+
+        // Hubs built from several hub chips may share a container id, prefer the same chain
+        let peer = match candidates
+            .iter()
+            .find(|info| info.port_chain() == self.info.port_chain())
+        {
+            Some(info) => info.clone(),
+            None if candidates.len() == 1 => candidates[0].clone(),
+            None => return None,
+        };
+        Some((peer, port))
     }
 
     /// Get Hub port status
@@ -427,7 +524,7 @@ impl BinaryObjectStoreDescriptor {
             let device_capability_type = DeviceCapabilityType::from(part[2]);
             if device_capability_type == DeviceCapabilityType::ContainerId && length == 20 {
                 let mut cid = [0u8; 16];
-                cid.copy_from_slice(&buf[4..20]);
+                cid.copy_from_slice(&part[4..20]);
                 return Some(ContainerId(cid));
             }
             part = &part[usize::from(length)..];
