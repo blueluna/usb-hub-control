@@ -6,7 +6,10 @@ use clap::Parser;
 use nusb::{DeviceInfo, MaybeFuture, Speed};
 use regex::Regex;
 
-use usb_hub_control::{DEVICE_CLASS_HUB, Error, Hub, PortStatus};
+use usb_hub_control::{
+    DEVICE_CLASS_HUB, DevicePower, Error, Hub, LogicalPowerSwitchingMode,
+    OverCurrentProtectionMode, PortStatus,
+};
 
 type InfoMap = BTreeMap<Vec<u8>, DeviceInfo>;
 
@@ -251,6 +254,182 @@ fn find(info_map: &InfoMap, pattern: &str) -> Result<(), String> {
     }
 }
 
+fn describe_hub_power(hub: &Hub) -> String {
+    let descriptor = hub.descriptor();
+    let mut parts = vec![];
+
+    match hub.self_powered() {
+        Ok(true) => parts.push("self-powered".to_string()),
+        Ok(false) => parts.push("bus-powered".to_string()),
+        Err(e) => parts.push(format!("power source unknown ({})", e)),
+    }
+    parts.push(format!(
+        "power switching {}",
+        match descriptor.logical_power_switching_mode() {
+            LogicalPowerSwitchingMode::IndividualPort => "individual",
+            LogicalPowerSwitchingMode::Common => "ganged",
+            LogicalPowerSwitchingMode::None => "none",
+        }
+    ));
+    parts.push(format!(
+        "over-current protection {}",
+        match descriptor.over_current_protection_mode() {
+            OverCurrentProtectionMode::IndividualPort => "individual",
+            OverCurrentProtectionMode::Global => "global",
+            OverCurrentProtectionMode::None => "none",
+        }
+    ));
+    parts.push(format!(
+        "power on to power good {} ms",
+        descriptor.power_on_to_power_good_ms()
+    ));
+    if !hub.is_super_speed() {
+        parts.push(format!(
+            "hub controller {} mA",
+            descriptor.hub_controller_current()
+        ));
+    }
+    if let Ok(power) = DevicePower::from_device_info(&hub.info()) {
+        parts.push(format!("bMaxPower {} mA", power.max_power_ma));
+    }
+    if descriptor.compound_device() {
+        parts.push("compound device".to_string());
+    }
+    parts.join(", ")
+}
+
+/// Power state of one half of a port
+struct PortPower {
+    powered: Option<bool>,
+    over_current: String,
+    budget: u16,
+    device: Option<DeviceInfo>,
+}
+
+fn port_power(hub: &Hub, port: u8, self_powered: bool, info_map: &InfoMap) -> PortPower {
+    let (powered, over_current, connection) = match hub.port_status_change(port) {
+        Ok((status, change)) => {
+            let mut over_current = if status.overcurrent() {
+                "OVER-CURRENT".to_string()
+            } else {
+                "ok".to_string()
+            };
+            if change.overcurrent() {
+                over_current.push_str(" changed");
+            }
+            (Some(status.powered()), over_current, status.connection())
+        }
+        Err(e) => (None, format!("? ({})", e), false),
+    };
+    let over_current = match hub.over_current_count(port) {
+        Some(count) if count > 0 => format!("{} ({}x)", over_current, count),
+        _ => over_current,
+    };
+    let device = if connection {
+        let mut child_key = key(&hub.info());
+        child_key.push(port);
+        info_map.get(&child_key).cloned()
+    } else {
+        None
+    };
+    PortPower {
+        powered,
+        over_current,
+        budget: hub.port_current_budget(self_powered),
+        device,
+    }
+}
+
+/// Show power related information for all ports on a hub, fused with its other speed half
+fn power_info(info_map: &InfoMap, hub_location: &str) -> Result<(), String> {
+    let key = parse_location(hub_location).ok_or("Invalid location")?;
+    let info = info_map.get(&key).ok_or("Hub not found")?;
+    let hub = Hub::from_device_info(info).map_err(|e| e.to_string())?;
+    let peer_hub = hub
+        .peer_port(1, info_map.values())
+        .and_then(|(peer_info, _)| Hub::from_device_info(&peer_info).ok());
+
+    let mut hubs = vec![&hub];
+    hubs.extend(peer_hub.as_ref());
+    hubs.sort_by_key(|hub| hub.is_super_speed());
+
+    for hub in &hubs {
+        let info = hub.info();
+        println!(
+            "{} {:04x}:{:04x} USB {}: {}",
+            location(&info),
+            info.vendor_id(),
+            info.product_id(),
+            if hub.is_super_speed() { 3 } else { 2 },
+            describe_hub_power(hub)
+        );
+    }
+    println!();
+    println!(
+        "{:<4}  {:<9}  {:<13}  {:<20}  {:<20}  device",
+        "port", "power", "budget", "over-current", "bMaxPower"
+    );
+
+    let self_powered = |hub: &Hub| hub.self_powered().unwrap_or(false);
+    let mut total = 0;
+    for port in 1..=hub.port_count() {
+        let mut halves = vec![(port_power(&hub, port, self_powered(&hub), info_map), &hub)];
+        if let Some((peer_info, peer_port)) = hub.peer_port(port, info_map.values()) {
+            let peer = Hub::from_device_info(&peer_info).map_err(|e| e.to_string())?;
+            halves.push((
+                port_power(&peer, peer_port, self_powered(&peer), info_map),
+                peer_hub.as_ref().unwrap_or(&hub),
+            ));
+        }
+        halves.sort_by_key(|(_, hub)| hub.is_super_speed());
+
+        let join = |f: &dyn Fn(&PortPower) -> String| {
+            halves
+                .iter()
+                .map(|(half, _)| f(half))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+        let power = join(&|half| match half.powered {
+            Some(true) => "on".to_string(),
+            Some(false) => "off".to_string(),
+            None => "?".to_string(),
+        });
+        let budget = format!("{} mA", join(&|half| half.budget.to_string()));
+        let over_current = join(&|half| half.over_current.clone());
+
+        let mut max_power = String::new();
+        let mut device = String::new();
+        for (half, _) in &halves {
+            let Some(info) = &half.device else {
+                continue;
+            };
+            match DevicePower::from_device_info(info) {
+                Ok(power) => {
+                    total += power.max_power_ma;
+                    max_power = format!("{} mA", power.max_power_ma);
+                    if power.self_powered {
+                        max_power.push_str(" self");
+                    }
+                    if power.max_power_ma > half.budget {
+                        max_power.push_str(" OVER BUDGET");
+                    }
+                }
+                Err(e) => max_power = format!("? ({})", e),
+            }
+            device = describe_device(info);
+        }
+
+        println!(
+            "{:<4}  {:<9}  {:<13}  {:<20}  {:<20}  {}",
+            port, power, budget, over_current, max_power, device
+        );
+    }
+    println!();
+    println!("Devices on this hub request {} mA in total", total);
+    Ok(())
+}
+
 fn list(info_map: &InfoMap) -> Result<(), Error> {
     let mut buffer = Vec::new();
     let mut visited = BTreeSet::new();
@@ -268,6 +447,45 @@ fn list(info_map: &InfoMap) -> Result<(), Error> {
     }
     let output = std::str::from_utf8(buffer.as_slice()).unwrap().to_string();
     println!("{}", output);
+    Ok(())
+}
+
+/// List hubs only, with the USB 2 and USB 3 halves of a hub fused
+fn list_hubs(info_map: &InfoMap) -> Result<(), Error> {
+    let mut visited = BTreeSet::new();
+    // USB 2 halves first, so fused hubs are listed by their USB 2 location
+    for super_speed in [false, true] {
+        for (key, info) in info_map.iter() {
+            if key.len() < 2
+                || info.class() != DEVICE_CLASS_HUB
+                || is_super_speed(info) != super_speed
+                || visited.contains(key)
+            {
+                continue;
+            }
+            let hub = Hub::from_device_info(info)?;
+            visited.insert(key.clone());
+
+            let mut line = format!(
+                "{:align$}{}",
+                "",
+                describe_hub_header(info, &hub),
+                align = (key.len() - 2) * 2
+            );
+            if let Some((peer_info, _)) = hub.peer_port(1, info_map.values()) {
+                let peer = Hub::from_device_info(&peer_info)?;
+                visited.insert(self::key(&peer_info));
+                line.push_str(" + ");
+                line.push_str(&describe_hub_header(&peer_info, &peer));
+            }
+            let switching = match hub.descriptor().logical_power_switching_mode() {
+                LogicalPowerSwitchingMode::IndividualPort => "individual",
+                LogicalPowerSwitchingMode::Common => "ganged",
+                LogicalPowerSwitchingMode::None => "none",
+            };
+            println!("{} {}", line.trim_end(), switching);
+        }
+    }
     Ok(())
 }
 
@@ -319,9 +537,16 @@ struct Args {
 enum Commands {
     /// List hubs and ports, with the USB 2 and USB 3 halves of a hub fused
     List,
+    /// List hubs only, without their ports
+    ListHub,
     /// Find the hub location and port of devices by vid:pid, or by text in manufacturer,
     /// product or serial
     Find { pattern: String },
+    /// Show power related information for all ports on a hub
+    PowerInfo {
+        #[arg(short, long)]
+        location: String,
+    },
     /// Switch port power off, or on with --on
     Power {
         #[arg(short, long)]
@@ -381,6 +606,8 @@ fn main() {
             switch_power(&info_map, &location, port, true, single)
         }),
         Some(Commands::Find { pattern }) => find(&info_map, &pattern),
+        Some(Commands::PowerInfo { location }) => power_info(&info_map, &location),
+        Some(Commands::ListHub) => list_hubs(&info_map).map_err(|e| format!("List failed, {}", e)),
         Some(Commands::List) | None => list(&info_map).map_err(|e| format!("List failed, {}", e)),
     };
     if let Err(e) = result {

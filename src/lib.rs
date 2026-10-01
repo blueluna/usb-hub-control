@@ -105,6 +105,8 @@ impl Hub {
         Ok(HubDescriptor {
             port_count,
             characteristics,
+            power_on_to_power_good: buf[5],
+            hub_controller_current: buf[6],
         })
     }
 
@@ -160,18 +162,33 @@ impl Hub {
     ///
     /// A USB 3 hub shows up as two hubs, one USB 2 and one SuperSpeed, and each physical
     /// connector has a port on both. On Linux the kernel's port peer links in sysfs are used.
-    /// Otherwise, or if they are missing, the hub with the same container id and the other
-    /// speed is used, assuming the same port number.
+    /// Otherwise the hub with the same container id and the other speed is used, assuming the
+    /// same port number. Not all ports have a peer, some hubs have fewer SuperSpeed ports.
     pub fn peer_port<'a>(
         &self,
         port: u8,
         devices: impl IntoIterator<Item = &'a DeviceInfo> + Clone,
     ) -> Option<(DeviceInfo, u8)> {
         #[cfg(target_os = "linux")]
-        if let Some(peer) = self.sysfs_peer_port(port, devices.clone()) {
-            return Some(peer);
+        if self.sysfs_port_dir(port).is_some() {
+            return self.sysfs_peer_port(port, devices);
         }
         self.container_id_peer_port(port, devices)
+    }
+
+    /// Sysfs directory of a port, e.g. 5-1.3:1.0/5-1.3-port4
+    #[cfg(target_os = "linux")]
+    fn sysfs_port_dir(&self, port: u8) -> Option<std::path::PathBuf> {
+        let path = self.info.sysfs_path();
+        let name = path.file_name()?.to_str()?;
+        let port_dir = format!("{}-port{}", name, port);
+
+        std::fs::read_dir(path)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(':'))
+            .map(|entry| entry.path().join(&port_dir))
+            .find(|path| path.is_dir())
     }
 
     #[cfg(target_os = "linux")]
@@ -180,18 +197,10 @@ impl Hub {
         port: u8,
         devices: impl IntoIterator<Item = &'a DeviceInfo>,
     ) -> Option<(DeviceInfo, u8)> {
-        let path = self.info.sysfs_path();
-        let name = path.file_name()?.to_str()?;
-        let port_dir = format!("{}-port{}", name, port);
-
-        // The port directories live in the hub interface directory, e.g. 5-1.3:1.0/5-1.3-port4
-        let peer = std::fs::read_dir(path)
-            .ok()?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains(':'))
-            .find_map(|entry| std::fs::read_link(entry.path().join(&port_dir).join("peer")).ok())?;
+        let port_dir = self.sysfs_port_dir(port)?;
+        let peer = std::fs::read_link(port_dir.join("peer")).ok()?;
         let peer = peer.file_name()?.to_str()?;
-        trace!("Port {} peer {}", port_dir, peer);
+        trace!("Port {} peer {}", port_dir.display(), peer);
 
         let (hub_name, peer_port) = peer.rsplit_once("-port")?;
         let peer_port = peer_port.parse::<u8>().ok()?;
@@ -230,6 +239,7 @@ impl Hub {
             .filter(|hub| {
                 hub.super_speed != self.super_speed
                     && hub.container_id.as_ref() == Some(container_id)
+                    && port <= hub.port_count()
             })
             .map(|hub| hub.info)
             .collect::<Vec<_>>();
@@ -248,6 +258,11 @@ impl Hub {
 
     /// Get Hub port status
     pub fn port_status(&self, port: u8) -> Result<PortStatus, Error> {
+        self.port_status_change(port).map(|(status, _)| status)
+    }
+
+    /// Get Hub port status and port change
+    pub fn port_status_change(&self, port: u8) -> Result<(PortStatus, PortChange), Error> {
         const STANDARD_REQUEST_GET_STATUS: u8 = 0x00;
 
         if port > self.hub_descriptor.port_count() {
@@ -268,13 +283,67 @@ impl Hub {
         )?;
         if len == 4 {
             let port_status = u16::from_le_bytes(buf[0..=1].try_into().unwrap());
-            let _port_change = u16::from_le_bytes(buf[2..=3].try_into().unwrap());
-            Ok(PortStatus::from_field(port_status, self.super_speed))
+            let port_change = u16::from_le_bytes(buf[2..=3].try_into().unwrap());
+            Ok((
+                PortStatus::from_field(port_status, self.super_speed),
+                PortChange(port_change),
+            ))
         } else {
             Err(Error::UsbTransferError(
                 nusb::transfer::TransferError::Fault,
             ))
         }
+    }
+
+    /// Get Hub descriptor
+    pub fn descriptor(&self) -> HubDescriptor {
+        self.hub_descriptor
+    }
+
+    /// Hub is currently self-powered, from the device status
+    pub fn self_powered(&self) -> Result<bool, Error> {
+        const STANDARD_REQUEST_GET_STATUS: u8 = 0x00;
+        const DEVICE_STATUS_SELF_POWERED: u16 = 0x0001;
+
+        let mut buf = vec![0; 2];
+        let len = self.device.control_in_blocking(
+            Control {
+                control_type: ControlType::Standard,
+                recipient: Recipient::Device,
+                request: STANDARD_REQUEST_GET_STATUS,
+                value: 0,
+                index: 0,
+            },
+            &mut buf,
+            Duration::from_secs(5),
+        )?;
+        if len != 2 {
+            return Err(Error::InvalidRespone);
+        }
+        Ok(u16::from_le_bytes(buf[0..=1].try_into().unwrap()) & DEVICE_STATUS_SELF_POWERED != 0)
+    }
+
+    /// Maximum current in mA a device may draw from a port, as specified for this hub
+    pub fn port_current_budget(&self, self_powered: bool) -> u16 {
+        match (self.super_speed, self_powered) {
+            (false, false) => 100,
+            (false, true) => 500,
+            (true, false) => 150,
+            (true, true) => 900,
+        }
+    }
+
+    /// Number of over-current events the kernel has seen on a port
+    #[cfg(target_os = "linux")]
+    pub fn over_current_count(&self, port: u8) -> Option<u32> {
+        let count = std::fs::read_to_string(self.sysfs_port_dir(port)?.join("over_current_count"));
+        count.ok()?.trim().parse().ok()
+    }
+
+    /// Number of over-current events the kernel has seen on a port
+    #[cfg(not(target_os = "linux"))]
+    pub fn over_current_count(&self, _port: u8) -> Option<u32> {
+        None
     }
 
     /// Set port power
@@ -410,6 +479,8 @@ pub enum LogicalPowerSwitchingMode {
 pub struct HubDescriptor {
     port_count: u8,
     characteristics: u16,
+    power_on_to_power_good: u8,
+    hub_controller_current: u8,
 }
 
 impl HubDescriptor {
@@ -428,6 +499,113 @@ impl HubDescriptor {
             HUB_CHARACTERISTICS_LPSM_INDIVIDUAL_PORT => LogicalPowerSwitchingMode::IndividualPort,
             HUB_CHARACTERISTICS_LPSM_COMMON => LogicalPowerSwitchingMode::Common,
             _ => LogicalPowerSwitchingMode::None,
+        }
+    }
+
+    /// Over-current Protection Mode of the hub
+    pub fn over_current_protection_mode(&self) -> OverCurrentProtectionMode {
+        match (self.characteristics >> 3) & 0x0003 {
+            0 => OverCurrentProtectionMode::Global,
+            1 => OverCurrentProtectionMode::IndividualPort,
+            _ => OverCurrentProtectionMode::None,
+        }
+    }
+
+    /// Hub is part of a compound device
+    pub fn compound_device(&self) -> bool {
+        self.characteristics & 0x0004 != 0
+    }
+
+    /// Time in ms from switching port power on until power is good on the port
+    pub fn power_on_to_power_good_ms(&self) -> u16 {
+        u16::from(self.power_on_to_power_good) * 2
+    }
+
+    /// Maximum current requirement of the hub controller electronics.
+    ///
+    /// In mA for a USB 2 hub. A SuperSpeed hub reports the raw value, as the unit is not mA.
+    pub fn hub_controller_current(&self) -> u8 {
+        self.hub_controller_current
+    }
+}
+
+/// Over-current Protection Mode
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OverCurrentProtectionMode {
+    /// Over-current is reported for all ports together
+    Global,
+    /// Over-current is reported per port
+    IndividualPort,
+    /// No over-current protection
+    None,
+}
+
+/// USB port change
+pub struct PortChange(pub u16);
+
+impl PortChange {
+    /// The over-current state of the port has changed since it was last cleared
+    pub fn overcurrent(&self) -> bool {
+        self.0 & 0x0008 != 0
+    }
+}
+
+/// Power information of a device, from its active configuration
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DevicePower {
+    /// Maximum current in mA the device draws from the bus (bMaxPower)
+    pub max_power_ma: u16,
+    /// Device can be self-powered (bmAttributes)
+    pub self_powered: bool,
+    /// Device supports remote wakeup (bmAttributes)
+    pub remote_wakeup: bool,
+}
+
+impl DevicePower {
+    const ATTRIBUTE_SELF_POWERED: u8 = 0x40;
+    const ATTRIBUTE_REMOTE_WAKEUP: u8 = 0x20;
+
+    /// Get power information of a device.
+    ///
+    /// On Linux this is read from sysfs, which works without access to the device itself.
+    pub fn from_device_info(info: &DeviceInfo) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            let read = |name: &str| std::fs::read_to_string(info.sysfs_path().join(name));
+            if let (Ok(max_power), Ok(attributes)) = (read("bMaxPower"), read("bmAttributes")) {
+                // The kernel already scales bMaxPower to mA, e.g. "100mA"
+                let max_power_ma = max_power
+                    .trim()
+                    .trim_end_matches("mA")
+                    .parse()
+                    .map_err(|_| Error::InvalidRespone)?;
+                let attributes =
+                    u8::from_str_radix(attributes.trim(), 16).map_err(|_| Error::InvalidRespone)?;
+                return Ok(Self::from_attributes(max_power_ma, attributes));
+            }
+        }
+
+        let device = info.open().wait()?;
+        let super_speed = matches!(
+            info.speed(),
+            Some(nusb::Speed::Super | nusb::Speed::SuperPlus)
+        );
+        let configuration = device
+            .active_configuration()
+            .map_err(|_| Error::InvalidRespone)?;
+        // bMaxPower is in units of 2 mA, or 8 mA when operating at SuperSpeed
+        let unit = if super_speed { 8 } else { 2 };
+        Ok(Self::from_attributes(
+            u16::from(configuration.max_power()) * unit,
+            configuration.attributes(),
+        ))
+    }
+
+    fn from_attributes(max_power_ma: u16, attributes: u8) -> Self {
+        Self {
+            max_power_ma,
+            self_powered: attributes & Self::ATTRIBUTE_SELF_POWERED != 0,
+            remote_wakeup: attributes & Self::ATTRIBUTE_REMOTE_WAKEUP != 0,
         }
     }
 }
