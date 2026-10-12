@@ -10,3 +10,4 @@ clap = { version = "4.5", features = ["derive"] }
 bitflags = "2.9"
 regex = "1.11"
 log = "0.4"
+ratatui = "0.29"
